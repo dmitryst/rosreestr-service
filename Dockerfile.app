@@ -1,7 +1,7 @@
 # Dockerfile.app (для API-сервера)
 
 # Этап 1: Установка зависимостей
-FROM python:3.9-slim as builder
+FROM python:3.9-bullseye as builder
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
