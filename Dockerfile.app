@@ -13,8 +13,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Этап 2: Сборка финального образа
 FROM python:3.9-slim
 WORKDIR /app
+RUN mkdir -p /app/output/geojson /app/rosreestr_queue
+
+# Копируем системные библиотеки, Python-пакеты
 COPY --from=builder /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu
 COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
+# Копируем исполняемые файлы, включая uvicorn ---
+COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Копируем ВЕСЬ код приложения
 COPY . .
