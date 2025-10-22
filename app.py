@@ -9,7 +9,15 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 
 # --- Конфигурация ---
-SHARED_DIR = Path("/app/rosreestr_queue") # Используем абсолютный путь для надежности в контейнере
+# Директория для файлов-задач (внутренняя очередь)
+QUEUE_DIR_PATH = os.getenv("QUEUE_DIR", "rosreestr_queue")
+QUEUE_DIR = Path(QUEUE_DIR_PATH)
+
+# Директория, куда скрипт-обработчик складывает РЕЗУЛЬТАТЫ (geojson)
+OUTPUT_DIR_PATH = os.getenv("OUTPUT_DIR", "output")
+OUTPUT_DIR = Path(OUTPUT_DIR_PATH)
+
+# Таймаут ожидания результата от внешнего скрипта в секундах
 REQUEST_TIMEOUT = 60
 # ---
 
@@ -23,14 +31,14 @@ app = FastAPI(
 
 # --- Вспомогательные функции, перенесенные из C# ---
 
-def web_mercator_to_wgs84(x, y):
+def webmercator_to_wgs84(x, y):
     """Преобразует координаты из Web Mercator (EPSG:3857) в WGS 84 (EPSG:4326)."""
     earth_radius = 6378137.0
     lon = (x / earth_radius) * 180.0 / math.pi
     lat = (2.0 * math.atan(math.exp(y / earth_radius)) - math.pi / 2.0) * 180.0 / math.pi
     return lon, lat
 
-def get_first_point(coordinates):
+def get_first_point_from_coordinates(coordinates):
     """Рекурсивно извлекает первую пару координат из структуры любой вложенности."""
     current_element = coordinates
     # Погружаемся вглубь массива, пока не дойдем до элемента с числами
@@ -43,68 +51,106 @@ def get_first_point(coordinates):
             return current_element
     return None
 
-# --- Основная логика ---
+# --- Жизненный цикл приложения ---
 
 @app.on_event("startup")
 def on_startup():
-    SHARED_DIR.mkdir(exist_ok=True)
-    logger.info(f"Общая папка для очереди: {SHARED_DIR.resolve()}")
+    # Создаем необходимые директории
+    QUEUE_DIR.mkdir(exist_ok=True)
+    (OUTPUT_DIR / "geojson").mkdir(parents=True, exist_ok=True)
+    logger.info(f"Директория для очереди задач: {QUEUE_DIR.resolve()}")
+    logger.info(f"Директория для результатов (geojson): {(OUTPUT_DIR / 'geojson').resolve()}")
+
+# --- API эндпоинты ---
 
 @app.get("/coordinates/{cadastral_number}",
          summary="Получить координаты по кадастровому номеру (через очередь)",
          response_description="Массив с широтой и долготой: [latitude, longitude]")
 async def get_coordinates(cadastral_number: str):
     task_id = str(uuid.uuid4())
-    task_file = SHARED_DIR / f"{task_id}.task"
-    result_file = SHARED_DIR / f"{task_id}.result"
+    task_file = QUEUE_DIR / f"{task_id}.task"
+    result_file = QUEUE_DIR / f"{task_id}.result"
+
+    safe_filename = cadastral_number.replace(":", "_") + ".geojson"
+    geojson_file = OUTPUT_DIR / "geojson" / safe_filename
     
     logger.info(f"Создание задачи {task_id} для {cadastral_number}")
 
     try:
-        # 1. Создаем файл задачи
+        # Создаем файл задачи
         with open(task_file, 'w', encoding='utf-8') as f:
             f.write(cadastral_number)
             
-        # 2. Ожидаем появления файла с результатом
+        # Ожидаем появления файла с результатом
         for _ in range(REQUEST_TIMEOUT):
-            if result_file.exists():
-                logger.info(f"Результат для задачи {task_id} найден")
-                with open(result_file, 'r', encoding='utf-8') as f:
-                    result_data = json.load(f)
-
-                if "error" in result_data:
-                    logger.error(f"Воркер сообщил об ошибке: {result_data['error']}")
-                    raise HTTPException(status_code=500, detail=f"Ошибка в воркере: {result_data['error']}")
+            if result_file.exists() or geojson_file.exists():
+                logger.info(f"Задача {task_id}: Обнаружен файл результата или geojson.")
                 
-                geometry = result_data.get("geometry")
-                if not geometry or "coordinates" not in geometry:
-                    raise HTTPException(status_code=404, detail="Геометрия или координаты отсутствуют в ответе.")
+                result_data = {}
                 
-                first_point_coords = get_first_point(geometry["coordinates"])
+                # Если geojson существует, он имеет приоритет
+                if geojson_file.exists():
+                    if result_file.exists():
+                        # Если есть и ошибка, и geojson - логируем ошибку как warning
+                        with open(result_file, 'r', encoding='utf-8') as f:
+                            error_content = json.load(f).get('error', 'Неизвестная ошибка')
+                        logger.warning(
+                            f"Задача {task_id}: Обнаружена ошибка, но GeoJSON файл найден. "
+                            f"Игнорируем ошибку и обрабатываем GeoJSON. Ошибка: {error_content}"
+                        )
 
+                    with open(geojson_file, 'r', encoding='utf-8') as f:
+                        result_data = json.load(f)
+                else: # geojson не найден, значит ошибка в .result файле критическая
+                    with open(result_file, 'r', encoding='utf-8') as f:
+                        result_data = json.load(f)
+                    error_detail = result_data.get('error', 'Неизвестная критическая ошибка')
+                    logger.error(f"Задача {task_id}: Произошла критическая ошибка, GeoJSON файл не найден: {error_detail}")
+                    if "403" in str(error_detail) or "forbidden" in str(error_detail).lower():
+                        raise HTTPException(status_code=403, detail=error_detail)
+                    else:
+                        raise HTTPException(status_code=500, detail=error_detail)
+
+                # Обрабатываем данные из geojson
+                geometry = result_data.get('geometry')
+                if not geometry or 'coordinates' not in geometry:
+                    raise HTTPException(status_code=404, detail="Координаты не найдены в геометрии")
+
+                first_point_coords = get_first_point_from_coordinates(geometry['coordinates'])
                 if not first_point_coords:
-                    raise HTTPException(status_code=404, detail="Не удалось извлечь координаты из геометрии.")
+                    raise HTTPException(status_code=404, detail="Не удалось извлечь точку из координат")
 
                 lon, lat = first_point_coords[0], first_point_coords[1]
+
+                crs_name = result_data.get('crs', {}).get('properties', {}).get('name', '')
+                logger.info(f"Задача {task_id}: Обнаружена система координат: '{crs_name}'")
                 
-                # Проверяем, нужна ли конвертация из EPSG:3857
-                crs_name = result_data.get("crs", {}).get("properties", {}).get("name", "")
-                if "EPSG:3857" in crs_name:
-                    logger.info(f"Координаты для {cadastral_number} будут конвертированы из EPSG:3857.")
-                    lon, lat = web_mercator_to_wgs84(lon, lat)
-                    return [lat, lon] # Возвращаем в порядке [lat, lon]
+                # Проверяем на наличие '3857' в строке, убрав возможные пробелы
+                is_mercator = False
+                if '3857' in crs_name:
+                    is_mercator = True
+                # Запасной вариант: если CRS не указан, проверяем значения координат
+                # Вероятно из-за того что библиотека падает при формировании KML, она не успевает записать crs в geojson
+                elif not crs_name and (abs(lon) > 180 or abs(lat) > 90):
+                    logger.warning(f"Задача {task_id}: CRS не указан, но значения координат ({lon}, {lat}) выходят за пределы WGS84. Предполагается, что это EPSG:3857.")
+                    is_mercator = True
+
+                if is_mercator:
+                    logger.info(f"Задача {task_id}: Выполняется конвертация из EPSG:3857 для {cadastral_number}.")
+                    lon, lat = webmercator_to_wgs84(lon, lat)
                 else:
-                    # Если CRS не указан или это WGS84, то rosreestr2coord возвращает [lon, lat]
-                    logger.info(f"Координаты для {cadastral_number} считаются WGS84. Конвертация не требуется.")
-                    return [lat, lon] # Меняем местами и возвращаем [lat, lon]
+                    logger.info(f"Задача {task_id}: Координаты для {cadastral_number} уже в WGS84 (или система не определена как EPSG:3857).")
+                
+                return [lat, lon]
 
             await asyncio.sleep(1)
 
-        logger.error(f"Таймаут для задачи {task_id}. Файл результата не появился.")
-        raise HTTPException(status_code=504, detail="Время ожидания ответа от воркера истекло.")
+        # Если цикл завершился, а результата нет — таймаут
+        logger.error(f"Задача {task_id}: Таймаут. Файл результата или GeoJSON не был создан за {REQUEST_TIMEOUT} секунд.")
+        raise HTTPException(status_code=504, detail="Таймаут шлюза: скрипт обработки координат не ответил вовремя.")
 
     finally:
-        # 4. Очищаем файлы
+        # Очищаем файлы
         if task_file.exists(): os.remove(task_file)
         if result_file.exists(): os.remove(result_file)
 
