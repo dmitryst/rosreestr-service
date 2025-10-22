@@ -1,5 +1,6 @@
 # worker.py (финальная версия)
 import logging
+import asyncio
 import json
 import time
 import os
@@ -7,92 +8,71 @@ import subprocess
 from pathlib import Path
 
 # --- Конфигурация ---
-SHARED_DIR = Path("./rosreestr_queue")
-# Папка, куда rosreestr2coord КЛАДЕТ РЕЗУЛЬТАТЫ по умолчанию
-OUTPUT_DIR = Path("./output/geojson")
+QUEUE_DIR_PATH = os.getenv("QUEUE_DIR", "rosreestr_queue")
+QUEUE_DIR = Path(QUEUE_DIR_PATH)
+OUTPUT_DIR_PATH = os.getenv("OUTPUT_DIR", "output")
+OUTPUT_DIR = Path(OUTPUT_DIR_PATH)
 POLL_INTERVAL = 1
 # ---
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - WORKER - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 def process_task(task_file: Path):
     """Обрабатывает один файл задачи."""
     task_id = task_file.stem
-    result_file = SHARED_DIR / f"{task_id}.result"
-    
-    # Имя файла, которое создаст библиотека
-    cadastral_number_safe = ""
+    result_error_file = QUEUE_DIR / f"{task_id}.error"
 
     try:
         with open(task_file, 'r', encoding='utf-8') as f:
             cadastral_number = f.read().strip()
-        
-        if not cadastral_number:
-            raise ValueError("Файл задачи пуст.")
-            
-        logging.info(f"Обработка задачи {task_id} для КН: {cadastral_number}")
+        logger.info(f"Обработка задачи {task_id} для КН: {cadastral_number}")
+
+        safe_filename_base = cadastral_number.replace(":", "_")
+        geojson_tmp_path = (OUTPUT_DIR / "geojson" / f"{safe_filename_base}.geojson.tmp")
+        geojson_final_path = (OUTPUT_DIR / "geojson" / f"{safe_filename_base}.geojson")
 
         # --- Выполнение через subprocess БЕЗ --output ---
         # Библиотека сама создаст файл в папке ./output/geojson
         command = f'python -m rosreestr2coord -c {cadastral_number}'
-        
-        proc = subprocess.run(command, shell=True, capture_output=True, text=True, encoding='utf-8')
 
-        if proc.returncode != 0:
-            raise RuntimeError(f"Ошибка rosreestr2coord: {proc.stderr.strip()}")
+        rosreestr_output_filename = geojson_tmp_path.parent / (safe_filename_base + ".geojson")
+        
+        result  = subprocess.run(command, shell=True, capture_output=True, text=True, encoding='utf-8')
 
-        # Формируем путь к файлу, который ДОЛЖНА была создать библиотека
-        cadastral_number_safe = cadastral_number.replace(":", "_")
-        expected_file = OUTPUT_DIR / f"{cadastral_number_safe}.geojson"
+        # Проверяем, создан ли geojson, даже если команда вернула ошибку (из-за KML)
+        if not rosreestr_output_filename.exists():
+            # Если файла нет, это настоящая ошибка
+            error_message = result.stderr or "rosreestr2coord не создал geojson файл."
+            raise Exception(error_message)
         
-        if not expected_file.exists():
-            raise FileNotFoundError(f"rosreestr2coord не создал ожидаемый файл: {expected_file}")
-        
-        logging.info(f"Найден файл результата: {expected_file}")
-        
-        # Читаем geojson из папки /output/geojson
-        with open(expected_file, 'r', encoding='utf-8') as f_temp:
-            geojson_data = json.load(f_temp)
-        # ---
-
-        # Запись успешного результата в .result файл для FastAPI
-        with open(result_file, 'w', encoding='utf-8') as f:
-            json.dump(geojson_data, f)
-        logging.info(f"Задача {task_id} успешно завершена")
+        # Атомарно переименовываем файл, давая сигнал, что он готов
+        rosreestr_output_filename.rename(geojson_final_path)
+        logger.info(f"Задача {task_id} успешно завершена. Результат в {geojson_final_path}")
 
     except Exception as e:
-        logging.error(f"Ошибка при обработке задачи {task_id}: {e}")
-        with open(result_file, 'w', encoding='utf-8') as f:
+        logger.error(f"Ошибка при обработке задачи {task_id}: {e}")
+        with open(result_error_file, 'w', encoding='utf-8') as f:
             json.dump({"error": str(e)}, f)
     finally:
-        # Очистка
-        if task_file.exists(): os.remove(task_file)
-        # Очищаем и созданный библиотекой файл
-        if cadastral_number_safe:
-             final_output_file = OUTPUT_DIR / f"{cadastral_number_safe}.geojson"
-             if final_output_file.exists(): os.remove(final_output_file)
+        # Удаляем файл задачи, чтобы не обрабатывать его снова
+        if task_file.exists():
+            os.remove(task_file)
 
-
-def main_loop():
-    """Главный цикл воркера."""
-    logging.info(f"Воркер запущен. Ожидание задач в папке: {SHARED_DIR.resolve()}")
-    SHARED_DIR.mkdir(exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True) # Создаем папку для результатов
-    
+async def main():
+    logger.info("Воркер запущен и слушает директорию...")
+    processed_tasks = set()
     while True:
         try:
-            task_files = list(SHARED_DIR.glob("*.task"))
-            if task_files:
-                process_task(task_files[0])
-            else:
-                time.sleep(POLL_INTERVAL)
-        except KeyboardInterrupt:
-            logging.info("Воркер остановлен.")
-            break
+            task_files = [f for f in QUEUE_DIR.glob('*.task') if f.is_file()]
+            for task_file in task_files:
+                if task_file.name not in processed_tasks:
+                    processed_tasks.add(task_file.name)
+                    process_task(task_file)
         except Exception as e:
-            logging.error(f"Неожиданная ошибка в главном цикле: {e}")
-            time.sleep(POLL_INTERVAL * 5)
+            logger.error(f"Критическая ошибка в главном цикле воркера: {e}")
+        await asyncio.sleep(1)
 
 if __name__ == "__main__":
-    main_loop()
+    asyncio.run(main())
 
