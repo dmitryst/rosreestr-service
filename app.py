@@ -71,6 +71,11 @@ async def get_coordinates(cadastral_number: str):
     task_file = QUEUE_DIR / f"{task_id}.task"
     result_file = QUEUE_DIR / f"{task_id}.result"
 
+    # Файлы-сигналы
+    result_error_file = QUEUE_DIR / f"{task_id}.error"
+    result_notfound_file = QUEUE_DIR / f"{task_id}.not_found" 
+    result_forbidden_file = QUEUE_DIR / f"{task_id}.forbidden"
+
     safe_filename = cadastral_number.replace(":", "_") + ".geojson"
     geojson_file = OUTPUT_DIR / "geojson" / safe_filename
     
@@ -83,33 +88,24 @@ async def get_coordinates(cadastral_number: str):
             
         # Ожидаем появления файла с результатом
         for _ in range(REQUEST_TIMEOUT):
-            if result_file.exists() or geojson_file.exists():
-                logger.info(f"Задача {task_id}: Обнаружен файл результата или geojson.")
+            if result_notfound_file.exists():
+                logger.warning(f"Задача {task_id}: Worker сообщил, что кадастровый номер не найден.")
+                raise HTTPException(status_code=404, detail="Кадастровый номер не найден")
+            
+            if result_forbidden_file.exists():
+                logger.warning(f"Задача {task_id}: Worker сообщил, что доступ к кадастровому номеру запрещен (403).")
+                raise HTTPException(status_code=403, detail="Доступ запрещен")
+            
+            if result_error_file.exists():
+                with open(result_error_file, 'r', encoding='utf-8') as f_err:
+                    error_detail = json.load(f_err).get('error', 'Неизвестная критическая ошибка')
+                    logger.error(f"Задача {task_id}: Worker сообщил о критической ошибке: {error_detail}")
+                    raise HTTPException(status_code=500, detail=error_detail)
                 
-                result_data = {}
-                
-                # Если geojson существует, он имеет приоритет
-                if geojson_file.exists():
-                    if result_file.exists():
-                        # Если есть и ошибка, и geojson - логируем ошибку как warning
-                        with open(result_file, 'r', encoding='utf-8') as f:
-                            error_content = json.load(f).get('error', 'Неизвестная ошибка')
-                        logger.warning(
-                            f"Задача {task_id}: Обнаружена ошибка, но GeoJSON файл найден. "
-                            f"Игнорируем ошибку и обрабатываем GeoJSON. Ошибка: {error_content}"
-                        )
-
-                    with open(geojson_file, 'r', encoding='utf-8') as f:
-                        result_data = json.load(f)
-                else: # geojson не найден, значит ошибка в .result файле критическая
-                    with open(result_file, 'r', encoding='utf-8') as f:
-                        result_data = json.load(f)
-                    error_detail = result_data.get('error', 'Неизвестная критическая ошибка')
-                    logger.error(f"Задача {task_id}: Произошла критическая ошибка, GeoJSON файл не найден: {error_detail}")
-                    if "403" in str(error_detail) or "forbidden" in str(error_detail).lower():
-                        raise HTTPException(status_code=403, detail=error_detail)
-                    else:
-                        raise HTTPException(status_code=500, detail=error_detail)
+            if geojson_file.exists():
+                logger.info(f"Задача {task_id}: GeoJSON файл найден.")
+                with open(geojson_file, 'r', encoding='utf-8') as f_geojson:
+                    result_data = json.load(f_geojson)
 
                 # Обрабатываем данные из geojson
                 geometry = result_data.get('geometry')
@@ -151,8 +147,10 @@ async def get_coordinates(cadastral_number: str):
 
     finally:
         # Очищаем файлы
-        if task_file.exists(): os.remove(task_file)
-        if result_file.exists(): os.remove(result_file)
+        for f in [task_file, result_error_file, geojson_file, result_notfound_file, result_forbidden_file]:
+            if f.exists():
+                try: os.remove(f)
+                except OSError as e: logger.error(f"Не удалось удалить файл {f}: {e}")
 
 @app.get("/", summary="Health Check")
 def health_check():

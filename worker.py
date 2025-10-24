@@ -21,7 +21,11 @@ logger = logging.getLogger(__name__)
 def process_task(task_file: Path):
     """Обрабатывает один файл задачи."""
     task_id = task_file.stem
+
+    # Файлы-сигнал
     result_error_file = QUEUE_DIR / f"{task_id}.error"
+    result_notfound_file = QUEUE_DIR / f"{task_id}.not_found"
+    result_forbidden_file = QUEUE_DIR / f"{task_id}.forbidden"
 
     try:
         with open(task_file, 'r', encoding='utf-8') as f:
@@ -40,10 +44,23 @@ def process_task(task_file: Path):
         
         result  = subprocess.run(command, shell=True, capture_output=True, text=True, encoding='utf-8')
 
+        # Объединяем stdout и stderr для поиска текста ошибки
+        output_text = (result.stdout + result.stderr).lower()
+
+        if "403" in output_text and "forbidden" in output_text:
+            logger.warning(f"Задача {task_id}: Для КН {cadastral_number} доступ запрещен (403). Создаем сигнал .forbidden")
+            result_forbidden_file.touch()
+            return
+
+        if "nothing found" in output_text.lower():
+            logger.warning(f"Задача {task_id}: Для КН {cadastral_number} ничего не найдено. Создаем сигнал .not_found")
+            result_notfound_file.touch() # Создаем пустой файл-сигнал
+            return
+
         # Проверяем, создан ли geojson, даже если команда вернула ошибку (из-за KML)
         if not rosreestr_output_filename.exists():
             # Если файла нет, это настоящая ошибка
-            error_message = result.stderr or "rosreestr2coord не создал geojson файл."
+            error_message = result.stderr.strip() or "rosreestr2coord не создал geojson файл."
             raise Exception(error_message)
         
         # Атомарно переименовываем файл, давая сигнал, что он готов
