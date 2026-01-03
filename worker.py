@@ -7,6 +7,12 @@ import os
 import subprocess
 from pathlib import Path
 
+# Данные прокси провайдера
+PROXY_HOST = os.getenv("PROXY_HOST")
+PROXY_PORT = os.getenv("PROXY_PORT")
+PROXY_USER = os.getenv("PROXY_USER")
+PROXY_PASS = os.getenv("PROXY_PASS")
+
 # --- Конфигурация ---
 QUEUE_DIR_PATH = os.getenv("QUEUE_DIR", "rosreestr_queue")
 QUEUE_DIR = Path(QUEUE_DIR_PATH)
@@ -36,13 +42,29 @@ def process_task(task_file: Path):
         geojson_tmp_path = (OUTPUT_DIR / "geojson" / f"{safe_filename_base}.geojson.tmp")
         geojson_final_path = (OUTPUT_DIR / "geojson" / f"{safe_filename_base}.geojson")
 
+        # --- Настройка прокси ---
+        if PROXY_HOST and PROXY_USER:
+            proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+
+            env = os.environ.copy()
+            env["HTTP_PROXY"] = proxy_url
+            env["HTTPS_PROXY"] = proxy_url
+
+            logger.info(f"Используем прокси: {PROXY_HOST}:{PROXY_PORT}")
+        else:
+            logger.warning("Переменные PROXY_... не найдены. Работаем БЕЗ прокси.")
+            env = os.environ.copy()
+
         # --- Выполнение через subprocess БЕЗ --output ---
         # Библиотека сама создаст файл в папке ./output/geojson
         command = f'python -m rosreestr2coord -c {cadastral_number}'
 
         rosreestr_output_filename = geojson_tmp_path.parent / (safe_filename_base + ".geojson")
         
-        result  = subprocess.run(command, shell=True, capture_output=True, text=True, encoding='utf-8')
+        result  = subprocess.run(command, shell=True, capture_output=True, text=True, encoding='utf-8', env=env)
+
+        # Собираем весь выхлоп скрипта в одну переменную для отладки
+        full_log = f"\n--- STDOUT ---\n{result.stdout}\n--- STDERR ---\n{result.stderr}\n----------------"
 
         # Объединяем stdout и stderr для поиска текста ошибки
         output_text = (result.stdout + result.stderr).lower()
@@ -60,7 +82,9 @@ def process_task(task_file: Path):
         # Проверяем, создан ли geojson, даже если команда вернула ошибку (из-за KML)
         if not rosreestr_output_filename.exists():
             # Если файла нет, это настоящая ошибка
-            error_message = result.stderr.strip() or "rosreestr2coord не создал geojson файл."
+            logger.error(f"Задача {task_id}: Файл не создан. Полный ответ утилиты: {full_log}")
+
+            error_message = result.stderr.strip() or result.stdout.strip() or "rosreestr2coord не создал geojson файл."
             raise Exception(error_message)
         
         # Атомарно переименовываем файл, давая сигнал, что он готов
