@@ -2,19 +2,48 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: FastAPI",
+            "name": "Debug API (FastAPI)",
             "type": "python",
             "request": "launch",
             "module": "uvicorn",
             "args": [
                 "app:app",
-                "--host",
-                "127.0.0.1",
+                "--reload",
                 "--port",
                 "8000"
             ],
             "jinja": true,
-            "justMyCode": true
+            "justMyCode": true,
+            "env": {
+                "QUEUE_DIR": "${workspaceFolder}/rosreestr_queue",
+                "OUTPUT_DIR": "${workspaceFolder}/output"
+            }
+        },
+        {
+            "name": "Debug Worker",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/worker.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "QUEUE_DIR": "${workspaceFolder}/rosreestr_queue",
+                "OUTPUT_DIR": "${workspaceFolder}/output",
+                // "PROXY_HOST": "gw.proxys.io",  
+                // "PROXY_PORT": "30000",
+                // "PROXY_USER": "ващ_логин",
+                // "PROXY_PASS": "ваш_пароль"
+            }
+        }
+    ],
+    "compounds": [
+        {
+            "name": "🚀 Full Stack (API + Worker)",
+            "configurations": [
+                "Debug API (FastAPI)",
+                "Debug Worker"
+            ],
+            "stopAll": true
         }
     ]
 }
