@@ -1,7 +1,3 @@
 fastapi
 uvicorn[standard]
 rosreestr2coord
-pynspd
-geopandas
-questionary
-typer
