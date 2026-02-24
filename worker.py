@@ -44,15 +44,14 @@ def process_task(task_file: Path):
 
         # --- Настройка прокси ---
         if PROXY_HOST and PROXY_USER:
+            # Используем строго http:// префикс для HTTP-прокси
             proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
-
             env = os.environ.copy()
             env["HTTP_PROXY"] = proxy_url
             env["HTTPS_PROXY"] = proxy_url
-
-            logger.info(f"Используем прокси: {PROXY_HOST}:{PROXY_PORT}")
+            logger.info(f"Используем HTTP-прокси: {PROXY_HOST}:{PROXY_PORT}")
         else:
-            logger.warning("Переменные PROXY_... не найдены. Работаем БЕЗ прокси.")
+            logger.warning("Переменные PROXY_... не найдены. Работаем без прокси.")
             env = os.environ.copy()
 
         # --- Выполнение через subprocess БЕЗ --output ---

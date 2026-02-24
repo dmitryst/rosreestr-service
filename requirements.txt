@@ -1,3 +1,4 @@
 fastapi
 uvicorn[standard]
-rosreestr2coord
+rosreestr2coord>=5.3.3
+PySocks==1.7.1
