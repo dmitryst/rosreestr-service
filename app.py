@@ -63,13 +63,71 @@ def on_startup():
 
 # --- API эндпоинты ---
 
+@app.get("/cadastral-info/{cadastral_number}",
+         summary="Получить полные данные GeoJSON по кадастровому номеру",
+         response_description="Полный GeoJSON объект Feature")
+async def get_cadastral_info(cadastral_number: str):  
+    task_id = str(uuid.uuid4())
+    task_file = QUEUE_DIR / f"{task_id}.task"
+
+    # Файлы-сигналы
+    result_error_file = QUEUE_DIR / f"{task_id}.error"
+    result_notfound_file = QUEUE_DIR / f"{task_id}.not_found" 
+    result_forbidden_file = QUEUE_DIR / f"{task_id}.forbidden"
+
+    safe_filename = cadastral_number.replace(":", "_") + ".geojson"
+    geojson_file = OUTPUT_DIR / "geojson" / safe_filename
+
+    logger.info(f"Создание задачи {task_id} для {cadastral_number}")
+
+    try:
+        # Создаем файл задачи
+        with open(task_file, 'w', encoding='utf-8') as f:
+            f.write(cadastral_number)
+
+        # Ожидаем появления файла с результатом
+        for _ in range(REQUEST_TIMEOUT):
+            if result_notfound_file.exists():
+                logger.warning(f"Задача {task_id}: Worker сообщил, что кадастровый номер не найден.")
+                raise HTTPException(status_code=404, detail="Кадастровый номер не найден")
+            
+            if result_forbidden_file.exists():
+                logger.warning(f"Задача {task_id}: Worker сообщил, что доступ к кадастровому номеру запрещен (403).")
+                raise HTTPException(status_code=403, detail="Доступ запрещен")
+            
+            if result_error_file.exists():
+                with open(result_error_file, 'r', encoding='utf-8') as f_err:
+                    error_detail = json.load(f_err).get('error', 'Неизвестная критическая ошибка')
+                    logger.error(f"Задача {task_id}: Worker сообщил о критической ошибке: {error_detail}")
+                    raise HTTPException(status_code=500, detail=error_detail)
+            
+            if geojson_file.exists():
+                logger.info(f"Задача {task_id}: GeoJSON файл найден.")
+                with open(geojson_file, 'r', encoding='utf-8') as f_geojson:
+                    result_data = json.load(f_geojson)
+                
+                # возвращаем сырой GeoJSON (тип Feature), который выдала библиотека
+                return result_data
+                
+            await asyncio.sleep(1)
+            
+        # Если цикл завершился, а результата нет — таймаут
+        logger.error(f"Задача {task_id}: Таймаут. Файл результата или GeoJSON не был создан за {REQUEST_TIMEOUT} секунд.")
+        raise HTTPException(status_code=504, detail="Таймаут шлюза: скрипт обработки координат не ответил вовремя.")
+    
+    finally:
+        # Очищаем файлы
+        for f in [task_file, result_error_file, geojson_file, result_notfound_file, result_forbidden_file]:
+            if f.exists():
+                try: os.remove(f)
+                except OSError as e: logger.error(f"Не удалось удалить файл {f}: {e}")
+
 @app.get("/coordinates/{cadastral_number}",
          summary="Получить координаты по кадастровому номеру (через очередь)",
          response_description="Массив с широтой и долготой: [latitude, longitude]")
 async def get_coordinates(cadastral_number: str):
     task_id = str(uuid.uuid4())
     task_file = QUEUE_DIR / f"{task_id}.task"
-    result_file = QUEUE_DIR / f"{task_id}.result"
 
     # Файлы-сигналы
     result_error_file = QUEUE_DIR / f"{task_id}.error"

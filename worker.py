@@ -1,4 +1,4 @@
-# worker.py (финальная версия)
+# worker.py
 import logging
 import asyncio
 import json
